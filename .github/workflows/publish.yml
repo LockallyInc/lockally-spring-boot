@@ -1,0 +1,46 @@
+# Release workflow for the Java SDK (Maven Central `com.lockally:lockally-sdk`).
+#
+# TEMPLATE — inert in this monorepo. Copy to `.github/workflows/publish.yml` in
+# the SDK's own repo (generated `sdk/java/` tree, pushed to
+# github.com/lockallyinc/lockally-java). Tag-driven: push `vX.Y.Z`.
+#
+# Maven Central is the most involved registry: it requires a Sonatype Central
+# account and GPG-signed artifacts. Before the first publish, the generated
+# pom.xml must declare the `central-publishing-maven-plugin` (or the classic
+# nexus-staging plugin) plus `maven-gpg-plugin` — set these via the java
+# generator config / a pom template, then this workflow signs and uploads.
+#
+# One-time setup:
+#   - Sonatype Central (central.sonatype.com) account; verify the `com.lockally`
+#     namespace via a DNS TXT record on lockally.com.
+#   - Repo secrets: OSSRH_USERNAME, OSSRH_TOKEN (Central user token),
+#     GPG_PRIVATE_KEY (ASCII-armored), GPG_PASSPHRASE. Claude never handles these.
+name: Publish Maven Central
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          server-id: central                       # matches <publishingServerId> in the pom
+          server-username: OSSRH_USERNAME
+          server-password: OSSRH_TOKEN
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Deploy (signed) to Central Portal
+        run: mvn --batch-mode -DskipTests -Dgpg.pinentryMode=loopback deploy -P sign-artifacts
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
