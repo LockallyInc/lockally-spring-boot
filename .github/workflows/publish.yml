@@ -1,0 +1,146 @@
+# Release workflow for the Java SDK (Maven Central `com.lockally:lockally-sdk`).
+#
+# TEMPLATE, inert in this monorepo. Copy to `.github/workflows/publish.yml` in
+# the SDK's own repo (generated `sdk/java/` tree, pushed to
+# github.com/lockallyinc/lockally-java). Tag-driven: push `vX.Y.Z`.
+#
+# Maven Central is the most involved registry: it requires a Sonatype Central
+# account and GPG-signed artifacts. Before the first publish, the generated
+# pom.xml must declare the `central-publishing-maven-plugin` (or the classic
+# nexus-staging plugin) plus `maven-gpg-plugin`: set these via the java
+# generator config / a pom template, then this workflow signs and uploads.
+#
+# One-time setup:
+#   - Sonatype Central (central.sonatype.com) account; verify the `com.lockally`
+#     namespace via a DNS TXT record on lockally.com.
+#   - Repo secrets: OSSRH_USERNAME, OSSRH_TOKEN (Central user token),
+#     GPG_PRIVATE_KEY (ASCII-armored), GPG_PASSPHRASE. Claude never handles these.
+name: Publish Maven Central
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          server-id: central                       # matches <publishingServerId> in the pom
+          server-username: OSSRH_USERNAME
+          server-password: OSSRH_TOKEN
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      # `-V` prints the Maven and JDK versions. That is not decoration: the
+      # Portal rejection this workflow fought for three releases came from
+      # non-artifact files that the runner's Maven writes into the plugin's
+      # staging tree, and it never reproduced on a local Maven 3.9.16. Without
+      # the version in the log there is no way to tell afterwards which Maven
+      # built a given release.
+      #
+      # `clean` is deliberate: a release has no reason to reuse previous build
+      # output, and deploying over a dirty target/ is one reported cause of the
+      # same rejection.
+      #
+      # The plugin pin lives in sdk/ci/patch-java-pom.py, with the evidence.
+      # This step tolerates exactly one error, the post-upload response-parse
+      # failure some versions have, and the Central check below is the real gate.
+      - name: Deploy (signed) to Central Portal
+        id: deploy
+        run: |
+          set +e
+          mvn --batch-mode -V -DskipTests -Dgpg.pinentryMode=loopback clean deploy -P sign-artifacts 2>&1 | tee mvn-deploy.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "maven exited clean"
+            exit 0
+          fi
+          # Only the known post-upload parse failure is survivable. Anything else
+          # (bad GPG, refused bundle, network) must fail here and not be masked.
+          if grep -q 'UnrecognizedPropertyException' mvn-deploy.log \
+             && grep -q 'Uploaded bundle successfully' mvn-deploy.log; then
+            echo "::warning::maven exited $status parsing the Portal's response AFTER a successful upload (known 0.7.0 bug). Verifying against Maven Central next."
+            exit 0
+          fi
+          echo "::error::maven failed for a reason other than the known response-parsing bug"
+          exit "$status"
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      # Whatever happened above, keep the bundle. Three releases were spent
+      # guessing at the Portal's "Bundle has content that does NOT have a .pom
+      # file" because the one artifact that would answer it, the zip we actually
+      # uploaded, was thrown away with the runner. The listing goes in the log so
+      # it is readable without downloading anything, and the zip is kept so the
+      # exact bytes can be inspected or handed to Sonatype. `if: always()` is the
+      # point: this is most needed on the failing run.
+      - name: Record the bundle we uploaded
+        if: always()
+        run: |
+          bundle=target/central-publishing/central-bundle.zip
+          if [ ! -f "$bundle" ]; then
+            echo "no bundle at $bundle (the build failed before staging)"
+            exit 0
+          fi
+          echo "## Bundle contents" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          unzip -Z1 "$bundle" | sort | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # The Portal names a path with no version when it rejects a bundle, so
+          # call out anything that is not under a version directory. This is what
+          # caught the real cause: maven-metadata-local.xml at the artifactId
+          # level, which is Maven local-repository bookkeeping and not an
+          # artifact at all.
+          version="${GITHUB_REF_NAME#v}"
+          if unzip -Z1 "$bundle" | grep -v "^com/lockally/lockally-sdk/${version}/" ; then
+            echo "::warning::bundle holds entries outside com/lockally/lockally-sdk/${version}/ (listed above)"
+          else
+            echo "every entry is under com/lockally/lockally-sdk/${version}/"
+          fi
+          # Non-artifact files anywhere in the bundle, named so a regression is
+          # recognisable rather than another round of guessing.
+          if unzip -Z1 "$bundle" | grep -E '(^|/)(maven-metadata-local\.xml|_remote\.repositories)' ; then
+            echo "::warning::bundle holds Maven local-repository bookkeeping files (listed above). These are what the Portal rejects as content with no .pom."
+          else
+            echo "no maven-metadata-local.xml or _remote.repositories in the bundle"
+          fi
+
+      - name: Upload the bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: central-bundle
+          path: |
+            target/central-publishing/central-bundle.zip
+            mvn-deploy.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The actual gate. Nothing above proves the artifact published, and the
+      # step before it is deliberately forgiving, so this is what decides whether
+      # the release happened. Central's sync lags the upload by minutes.
+      - name: Verify the artifact reached Maven Central
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          url="https://repo1.maven.org/maven2/com/lockally/lockally-sdk/${version}/lockally-sdk-${version}.pom"
+          echo "waiting for $url"
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "published: com.lockally:lockally-sdk:${version} is on Maven Central"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::com.lockally:lockally-sdk:${version} did not appear on Maven Central within 30 minutes"
+          exit 1
